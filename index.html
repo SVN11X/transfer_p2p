@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transferencia P2P de archivos grandes</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>📦 Transferencia de archivos P2P</h1>
+    <p class="subtitle">Sin límite de tamaño · Directo entre navegadores · Sin subir a servidores</p>
+
+    <!-- Panel de envío -->
+    <div id="senderPanel" class="panel">
+      <h2>📤 Enviar archivo</h2>
+      <label for="fileInput" class="file-label">Seleccionar archivo</label>
+      <input type="file" id="fileInput" hidden>
+      <div id="fileInfo" class="file-info"></div>
+      <button id="createRoomBtn" disabled>Generar enlace de envío</button>
+      <div id="roomInfo" class="room-info" style="display:none;">
+        <p>Comparte este ID con el receptor:</p>
+        <div class="id-box">
+          <span id="roomIdDisplay"></span>
+          <button id="copyBtn">📋 Copiar</button>
+        </div>
+        <p>O comparte este enlace:</p>
+        <a id="roomLink" href="#" target="_blank"></a>
+      </div>
+      <div id="sendProgress" class="progress" style="display:none;">
+        <div class="progress-bar">
+          <div id="sendBarFill" class="fill"></div>
+        </div>
+        <span id="sendPercent">0%</span>
+      </div>
+      <p id="sendStatus"></p>
+    </div>
+
+    <!-- Panel de recepción -->
+    <div id="receiverPanel" class="panel">
+      <h2>📥 Recibir archivo</h2>
+      <input type="text" id="remoteIdInput" placeholder="Pega el ID o enlace del remitente">
+      <button id="connectBtn">Conectar</button>
+      <div id="receiveProgress" class="progress" style="display:none;">
+        <div class="progress-bar">
+          <div id="receiveBarFill" class="fill"></div>
+        </div>
+        <span id="receivePercent">0%</span>
+      </div>
+      <p id="receiveStatus"></p>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
