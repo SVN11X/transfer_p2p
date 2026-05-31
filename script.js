@@ -1,5 +1,9 @@
 // Transferencia P2P con PeerJS + WebRTC
-// Versión corregida: mensajes tipados, control de buffer real y descarga sin revocar el Blob antes de tiempo.
+// Versión optimizada para archivos grandes:
+// - Chunks de 256 KB.
+// - Envío binario directo, sin envolver cada chunk en objetos.
+// - Control de buffer real con RTCDataChannel.bufferedAmount.
+// - Recepción compatible con memoria y guardado directo en disco si el navegador lo permite.
 
 const PEER_CONFIG = {
   host: '0.peerjs.com',
@@ -14,9 +18,11 @@ const PEER_CONFIG = {
   }
 };
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB
+// Para más estabilidad usa 256 KB. Si tu red es muy buena, puedes probar 512 * 1024.
+const CHUNK_SIZE = 256 * 1024; // 256 KB
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // Pausa si hay más de 8 MB en cola
 const LOW_BUFFERED_AMOUNT = 2 * 1024 * 1024; // Retoma cuando baja a 2 MB
+const LARGE_FILE_THRESHOLD = 512 * 1024 * 1024; // Desde 512 MB se recomienda guardar directo en disco
 
 let peer = null;
 let conn = null;
@@ -26,38 +32,60 @@ let receiveCompleted = false;
 let receiverReady = false;
 let receiverReadyResolver = null;
 
+let sendStartTime = null;
+let receiveStartTime = null;
+let activeDownloadUrl = null;
+
 // ---------- Utilidades ----------
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 Bytes';
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 Bytes';
+
   const k = 1024;
   const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
+
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
+}
+
+function formatTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--';
+
+  const totalSeconds = Math.ceil(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  if (hours > 0) return `${hours} h ${minutes} min ${secs} s`;
+  if (minutes > 0) return `${minutes} min ${secs} s`;
+  return `${secs} s`;
+}
+
+function calculateTransferStats(doneBytes, totalBytes, startTime) {
+  if (!startTime || doneBytes <= 0) {
+    return {
+      speedText: '0 MB/s',
+      remainingText: '--'
+    };
+  }
+
+  const elapsedSeconds = Math.max((Date.now() - startTime) / 1000, 0.001);
+  const bytesPerSecond = doneBytes / elapsedSeconds;
+  const remainingBytes = Math.max(totalBytes - doneBytes, 0);
+  const remainingSeconds = bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : Infinity;
+
+  return {
+    speedText: `${formatBytes(bytesPerSecond)}/s`,
+    remainingText: formatTime(remainingSeconds)
+  };
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function safeCloseCurrentPeer() {
-  try {
-    if (conn && conn.open) conn.close();
-  } catch (e) {
-    console.warn('No se pudo cerrar la conexión anterior:', e);
-  }
-
-  try {
-    if (peer && !peer.destroyed) peer.destroy();
-  } catch (e) {
-    console.warn('No se pudo destruir el peer anterior:', e);
-  }
-
-  conn = null;
-  peer = null;
-}
-
 function extractPeerId(input) {
   const value = input.trim();
+
   try {
     const url = new URL(value);
     return url.searchParams.get('room') || value;
@@ -80,8 +108,30 @@ async function normalizeBinary(payload) {
   return null;
 }
 
+function supportsDirectDiskSave() {
+  return Boolean(window.isSecureContext && window.showSaveFilePicker);
+}
+
+function safeCloseCurrentPeer() {
+  try {
+    if (conn && conn.open) conn.close();
+  } catch (e) {
+    console.warn('No se pudo cerrar la conexión anterior:', e);
+  }
+
+  try {
+    if (peer && !peer.destroyed) peer.destroy();
+  } catch (e) {
+    console.warn('No se pudo destruir el peer anterior:', e);
+  }
+
+  conn = null;
+  peer = null;
+}
+
 async function waitForLowBuffer(connection) {
   const dc = connection?.dataChannel;
+
   if (!dc) {
     await sleep(5);
     return;
@@ -110,7 +160,14 @@ async function waitForLowBuffer(connection) {
 }
 
 function downloadBlob(blob, filename) {
+  if (activeDownloadUrl) {
+    URL.revokeObjectURL(activeDownloadUrl);
+    activeDownloadUrl = null;
+  }
+
   const url = URL.createObjectURL(blob);
+  activeDownloadUrl = url;
+
   const a = document.createElement('a');
   a.href = url;
   a.download = filename || 'archivo_recibido';
@@ -120,19 +177,75 @@ function downloadBlob(blob, filename) {
   document.body.removeChild(a);
 
   // No revocar de inmediato: algunos navegadores todavía están iniciando la descarga.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  setTimeout(() => {
+    if (activeDownloadUrl === url) {
+      URL.revokeObjectURL(url);
+      activeDownloadUrl = null;
+    }
+  }, 60_000);
 }
 
 function setSendProgress(sentBytes, totalBytes) {
   const percent = totalBytes === 0 ? 100 : Math.min(100, Math.floor((sentBytes / totalBytes) * 100));
+  const stats = calculateTransferStats(sentBytes, totalBytes, sendStartTime);
+
   sendBarFill.style.width = `${percent}%`;
   sendPercent.textContent = `${percent}%`;
+
+  if (sendStartTime && sentBytes > 0 && sentBytes < totalBytes) {
+    sendStatus.textContent = `Enviando archivo... ${formatBytes(sentBytes)} de ${formatBytes(totalBytes)} · ${stats.speedText} · restante: ${stats.remainingText}`;
+  }
 }
 
 function setReceiveProgress(receivedBytes, totalBytes) {
   const percent = totalBytes === 0 ? 100 : Math.min(100, Math.floor((receivedBytes / totalBytes) * 100));
+  const stats = calculateTransferStats(receivedBytes, totalBytes, receiveStartTime);
+
   receiveBarFill.style.width = `${percent}%`;
   receivePercent.textContent = `${percent}%`;
+
+  if (receiveStartTime && receivedBytes > 0 && receivedBytes < totalBytes && fileMeta) {
+    receiveStatus.textContent = `Recibiendo: ${fileMeta.name} · ${formatBytes(receivedBytes)} de ${formatBytes(totalBytes)} · ${stats.speedText} · restante: ${stats.remainingText}`;
+  }
+}
+
+function clearStorageChoiceControls() {
+  const oldControls = document.getElementById('storageChoiceControls');
+  if (oldControls) oldControls.remove();
+}
+
+function createStorageChoiceControls(meta, onDirectDisk, onMemory) {
+  clearStorageChoiceControls();
+
+  const wrapper = document.createElement('div');
+  wrapper.id = 'storageChoiceControls';
+  wrapper.style.marginTop = '12px';
+  wrapper.style.display = 'flex';
+  wrapper.style.flexDirection = 'column';
+  wrapper.style.gap = '8px';
+
+  const info = document.createElement('p');
+  info.style.margin = '0';
+  info.textContent = `Archivo entrante: ${meta.name} (${formatBytes(meta.size)}).`;
+  wrapper.appendChild(info);
+
+  if (supportsDirectDiskSave()) {
+    const diskButton = document.createElement('button');
+    diskButton.type = 'button';
+    diskButton.textContent = 'Guardar directo en disco recomendado';
+    diskButton.addEventListener('click', onDirectDisk);
+    wrapper.appendChild(diskButton);
+  }
+
+  const memoryButton = document.createElement('button');
+  memoryButton.type = 'button';
+  memoryButton.textContent = supportsDirectDiskSave()
+    ? 'Usar descarga normal consume más memoria'
+    : 'Continuar con descarga normal';
+  memoryButton.addEventListener('click', onMemory);
+  wrapper.appendChild(memoryButton);
+
+  receiveStatus.insertAdjacentElement('afterend', wrapper);
 }
 
 // ---------- Elementos del panel de envío ----------
@@ -163,7 +276,7 @@ if (urlParams.has('room')) {
 }
 
 // ---------- Envío ----------
-fileInput.addEventListener('change', (event) => {
+fileInput.addEventListener('change', event => {
   selectedFile = event.target.files[0] || null;
 
   if (selectedFile) {
@@ -182,6 +295,7 @@ createRoomBtn.addEventListener('click', () => {
   sendCompleted = false;
   receiverReady = false;
   receiverReadyResolver = null;
+  sendStartTime = null;
 
   sendProgress.style.display = 'none';
   sendBarFill.style.width = '0%';
@@ -190,7 +304,7 @@ createRoomBtn.addEventListener('click', () => {
 
   peer = new Peer(undefined, PEER_CONFIG);
 
-  peer.on('open', (id) => {
+  peer.on('open', id => {
     console.log('Emisor: Peer abierto con ID', id);
     roomIdDisplay.textContent = id;
 
@@ -206,12 +320,12 @@ createRoomBtn.addEventListener('click', () => {
     sendStatus.textContent = 'Esperando al receptor...';
   });
 
-  peer.on('connection', (connection) => {
+  peer.on('connection', connection => {
     conn = connection;
     sendStatus.textContent = 'Receptor conectado. Preparando transferencia...';
     console.log('Emisor: Conexión entrante establecida');
 
-    conn.on('data', (message) => {
+    conn.on('data', message => {
       if (message && typeof message === 'object' && message.type === 'ready') {
         receiverReady = true;
         if (receiverReadyResolver) receiverReadyResolver();
@@ -233,13 +347,13 @@ createRoomBtn.addEventListener('click', () => {
       }
     });
 
-    conn.on('error', (error) => {
+    conn.on('error', error => {
       console.error('Emisor: Error en conexión:', error);
       sendStatus.textContent = `Error de conexión: ${error.message || error}`;
     });
   });
 
-  peer.on('error', (error) => {
+  peer.on('error', error => {
     console.error('Emisor: Error en Peer:', error);
     sendStatus.textContent = `Error PeerJS: ${error.message || error}`;
   });
@@ -256,7 +370,7 @@ copyBtn.addEventListener('click', async () => {
   setTimeout(() => (copyBtn.textContent = '📋 Copiar'), 2000);
 });
 
-async function waitForReceiverReady(timeoutMs = 30_000) {
+async function waitForReceiverReady(timeoutMs = 5 * 60 * 1000) {
   if (receiverReady) return;
 
   await new Promise((resolve, reject) => {
@@ -290,6 +404,7 @@ async function sendFile() {
   sendStatus.textContent = 'Esperando confirmación del receptor...';
   await waitForReceiverReady();
 
+  sendStartTime = Date.now();
   sendStatus.textContent = 'Enviando archivo...';
 
   for (let index = 0; index < totalChunks; index++) {
@@ -299,24 +414,23 @@ async function sendFile() {
     const end = Math.min(start + CHUNK_SIZE, selectedFile.size);
     const payload = await selectedFile.slice(start, end).arrayBuffer();
 
-    conn.send({
-      type: 'chunk',
-      index,
-      size: payload.byteLength,
-      payload
-    });
+    // Envío binario directo: más liviano que envolver cada chunk en un objeto.
+    conn.send(payload);
 
     sentBytes += payload.byteLength;
     setSendProgress(sentBytes, selectedFile.size);
     await waitForLowBuffer(conn);
 
+    // Cede control al navegador cada cierto número de chunks para evitar congelamientos.
     if (index % 50 === 0) await sleep(0);
   }
 
+  await waitForLowBuffer(conn);
   conn.send({ type: 'end' });
+
   sendCompleted = true;
   setSendProgress(selectedFile.size, selectedFile.size);
-  sendStatus.textContent = '✅ Archivo enviado completamente.';
+  sendStatus.textContent = `✅ Archivo enviado completamente: ${selectedFile.name} (${formatBytes(selectedFile.size)}).`;
   console.log('Emisor: Transferencia finalizada');
 }
 
@@ -324,11 +438,14 @@ async function sendFile() {
 let receivedChunks = [];
 let fileMeta = null;
 let receivedBytes = 0;
-let pendingChunkTasks = [];
-let legacyBinaryIndex = 0;
+let nextChunkIndex = 0;
+let receiveQueue = Promise.resolve();
+let receiveMode = 'memory';
+let fileWriter = null;
 
 connectBtn.addEventListener('click', () => {
   const rawRemoteId = remoteIdInput.value.trim();
+
   if (!rawRemoteId) {
     receiveStatus.textContent = 'Por favor ingresa un ID o enlace.';
     return;
@@ -337,21 +454,21 @@ connectBtn.addEventListener('click', () => {
   const peerId = extractPeerId(rawRemoteId);
 
   safeCloseCurrentPeer();
+  resetReceivingState({ abortWriter: true });
+
   receiveCompleted = false;
-  receivedChunks = [];
-  fileMeta = null;
-  receivedBytes = 0;
-  pendingChunkTasks = [];
-  legacyBinaryIndex = 0;
+  receiveStartTime = null;
+  receiveQueue = Promise.resolve();
 
   receiveProgress.style.display = 'none';
   receiveBarFill.style.width = '0%';
   receivePercent.textContent = '0%';
   receiveStatus.textContent = 'Creando conexión...';
+  clearStorageChoiceControls();
 
   peer = new Peer(undefined, PEER_CONFIG);
 
-  peer.on('open', (id) => {
+  peer.on('open', id => {
     console.log('Receptor: Peer abierto con ID', id);
     receiveStatus.textContent = 'Conectando con el emisor...';
 
@@ -367,54 +484,47 @@ connectBtn.addEventListener('click', () => {
       remoteIdInput.disabled = true;
     });
 
-    conn.on('data', (data) => {
-      handleIncomingData(data).catch(error => {
-        console.error('Receptor: Error procesando datos:', error);
-        receiveStatus.textContent = `Error recibiendo archivo: ${error.message || error}`;
-      });
+    conn.on('data', data => {
+      receiveQueue = receiveQueue
+        .then(() => handleIncomingData(data))
+        .catch(error => {
+          console.error('Receptor: Error procesando datos:', error);
+          receiveStatus.textContent = `Error recibiendo archivo: ${error.message || error}`;
+          resetReceivingState({ abortWriter: true });
+        });
     });
 
     conn.on('close', () => {
       console.log('Receptor: DataChannel cerrado');
       if (!receiveCompleted) {
         receiveStatus.textContent = 'Conexión cerrada antes de completar la descarga.';
+        resetReceivingState({ abortWriter: true });
       }
     });
 
-    conn.on('error', (error) => {
+    conn.on('error', error => {
       console.error('Receptor: Error en conexión:', error);
       receiveStatus.textContent = `Error de conexión: ${error.message || error}`;
+      resetReceivingState({ abortWriter: true });
     });
   });
 
-  peer.on('error', (error) => {
+  peer.on('error', error => {
     console.error('Receptor: Error en Peer:', error);
     receiveStatus.textContent = `Error PeerJS: ${error.message || error}`;
+    resetReceivingState({ abortWriter: true });
   });
 });
 
 async function handleIncomingData(data) {
   if (data && typeof data === 'object' && data.type === 'meta') {
-    fileMeta = data;
-    receivedChunks = new Array(data.totalChunks);
-    receivedBytes = 0;
-    pendingChunkTasks = [];
-    legacyBinaryIndex = 0;
-
-    receiveProgress.style.display = 'block';
-    setReceiveProgress(0, data.size);
-    receiveStatus.textContent = `Recibiendo: ${data.name} (${formatBytes(data.size)})`;
-
-    // Confirmación explícita para que el emisor no dispare chunks antes de que el receptor esté listo.
-    conn.send({ type: 'ready' });
-    console.log('Receptor: Metadata recibida y confirmada', data);
+    await prepareReceivingFile(data);
     return;
   }
 
   if (data && typeof data === 'object' && data.type === 'chunk') {
-    const task = receiveChunk(data.index, data.payload, data.size);
-    pendingChunkTasks.push(task);
-    await task;
+    // Compatibilidad con versiones anteriores que enviaban chunks dentro de objetos.
+    await receiveBinaryChunk(data.payload, data.index, data.size);
     return;
   }
 
@@ -424,23 +534,103 @@ async function handleIncomingData(data) {
     return;
   }
 
-  // Compatibilidad con versiones anteriores que enviaban binario sin envolver en objeto.
+  // Versión optimizada: los chunks llegan como ArrayBuffer directo.
   const binary = await normalizeBinary(data);
+
   if (binary && fileMeta) {
-    receivedChunks[legacyBinaryIndex] = binary;
-    legacyBinaryIndex++;
-    receivedBytes += binary.byteLength;
-    setReceiveProgress(receivedBytes, fileMeta.size);
+    await receiveBinaryChunk(binary, nextChunkIndex, binary.byteLength);
+    nextChunkIndex += 1;
+    return;
   }
+
+  console.warn('Receptor: Mensaje no reconocido', data);
 }
 
-async function receiveChunk(index, payload, declaredSize) {
+async function prepareReceivingFile(meta) {
+  fileMeta = meta;
+  receivedBytes = 0;
+  nextChunkIndex = 0;
+  receiveStartTime = null;
+  clearStorageChoiceControls();
+
+  receiveProgress.style.display = 'block';
+  setReceiveProgress(0, meta.size);
+
+  const shouldAskForStorage = meta.size >= LARGE_FILE_THRESHOLD;
+
+  if (shouldAskForStorage) {
+    receiveStatus.textContent = supportsDirectDiskSave()
+      ? 'Archivo grande detectado. Elige cómo guardarlo para iniciar la transferencia.'
+      : 'Archivo grande detectado. Este navegador no permite guardado directo en disco; se usará descarga normal.';
+
+    await chooseReceivingMode(meta);
+  } else {
+    receiveMode = 'memory';
+    receivedChunks = new Array(meta.totalChunks);
+  }
+
+  receiveStartTime = Date.now();
+  receiveStatus.textContent = `Listo para recibir: ${meta.name} (${formatBytes(meta.size)})`;
+
+  // Confirmación explícita para que el emisor no dispare chunks antes de que el receptor esté listo.
+  conn.send({ type: 'ready' });
+  console.log('Receptor: Metadata recibida y confirmada', meta, 'modo:', receiveMode);
+}
+
+function chooseReceivingMode(meta) {
+  return new Promise(resolve => {
+    const useMemory = () => {
+      receiveMode = 'memory';
+      receivedChunks = new Array(meta.totalChunks);
+      fileWriter = null;
+      clearStorageChoiceControls();
+      resolve();
+    };
+
+    const useDirectDisk = async () => {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: meta.name || 'archivo_recibido'
+        });
+
+        fileWriter = await handle.createWritable();
+        receiveMode = 'disk';
+        receivedChunks = [];
+        clearStorageChoiceControls();
+        resolve();
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          receiveStatus.textContent = 'No se eligió ubicación. Elige una opción para iniciar la transferencia.';
+          return;
+        }
+
+        console.error('No se pudo usar guardado directo:', error);
+        receiveStatus.textContent = 'No se pudo usar guardado directo. Puedes continuar con descarga normal.';
+      }
+    };
+
+    if (!supportsDirectDiskSave()) {
+      useMemory();
+      return;
+    }
+
+    createStorageChoiceControls(meta, useDirectDisk, useMemory);
+  });
+}
+
+async function receiveBinaryChunk(payload, index, declaredSize) {
   if (!fileMeta) throw new Error('Llegó un chunk antes de la metadata.');
 
   const binary = await normalizeBinary(payload);
   if (!binary) throw new Error(`Chunk ${index} no llegó como dato binario válido.`);
 
-  receivedChunks[index] = binary;
+  if (receiveMode === 'disk') {
+    if (!fileWriter) throw new Error('No existe escritor de archivo para guardar en disco.');
+    await fileWriter.write(binary);
+  } else {
+    receivedChunks[index] = binary;
+  }
+
   receivedBytes += declaredSize || binary.byteLength;
   setReceiveProgress(receivedBytes, fileMeta.size);
 }
@@ -448,29 +638,49 @@ async function receiveChunk(index, payload, declaredSize) {
 async function finishReceivingFile() {
   if (!fileMeta) throw new Error('No hay metadata del archivo recibido.');
 
-  receiveStatus.textContent = 'Archivo recibido. Preparando descarga...';
-  await Promise.all(pendingChunkTasks);
+  receiveStatus.textContent = 'Archivo recibido. Verificando integridad...';
 
-  const missingChunks = [];
-  for (let i = 0; i < fileMeta.totalChunks; i++) {
-    if (!receivedChunks[i]) missingChunks.push(i);
+  if (receivedBytes !== fileMeta.size) {
+    throw new Error(`Tamaño incorrecto: se esperaban ${formatBytes(fileMeta.size)} y se recibieron ${formatBytes(receivedBytes)}.`);
   }
 
-  if (missingChunks.length > 0) {
-    throw new Error(`Faltan ${missingChunks.length} partes del archivo. Primera parte faltante: ${missingChunks[0]}.`);
+  if (receiveMode === 'disk') {
+    if (!fileWriter) throw new Error('No existe escritor de archivo para finalizar el guardado.');
+
+    await fileWriter.close();
+    fileWriter = null;
+
+    setReceiveProgress(fileMeta.size, fileMeta.size);
+    receiveCompleted = true;
+    receiveStatus.textContent = `✅ Archivo guardado completamente: ${fileMeta.name} (${formatBytes(fileMeta.size)}).`;
+    console.log('Receptor: Archivo guardado en disco', { name: fileMeta.name, size: fileMeta.size });
+  } else {
+    receiveStatus.textContent = 'Archivo recibido. Preparando descarga...';
+
+    const missingChunks = [];
+    for (let i = 0; i < fileMeta.totalChunks; i++) {
+      if (!receivedChunks[i]) missingChunks.push(i);
+    }
+
+    if (missingChunks.length > 0) {
+      throw new Error(`Faltan ${missingChunks.length} partes del archivo. Primera parte faltante: ${missingChunks[0]}.`);
+    }
+
+    const blob = new Blob(receivedChunks, { type: 'application/octet-stream' });
+
+    if (blob.size !== fileMeta.size) {
+      throw new Error(`Tamaño incorrecto: se esperaban ${formatBytes(fileMeta.size)} y se recibieron ${formatBytes(blob.size)}.`);
+    }
+
+    downloadBlob(blob, fileMeta.name);
+    setReceiveProgress(fileMeta.size, fileMeta.size);
+    receiveCompleted = true;
+    receiveStatus.textContent = `✅ Descarga completada: ${fileMeta.name} (${formatBytes(blob.size)}).`;
+    console.log('Receptor: Descarga completada', { name: fileMeta.name, size: blob.size });
+
+    // Se liberan referencias a chunks después de iniciar la descarga.
+    receivedChunks = [];
   }
-
-  const blob = new Blob(receivedChunks, { type: 'application/octet-stream' });
-
-  if (blob.size !== fileMeta.size) {
-    throw new Error(`Tamaño incorrecto: se esperaban ${formatBytes(fileMeta.size)} y se recibieron ${formatBytes(blob.size)}.`);
-  }
-
-  downloadBlob(blob, fileMeta.name);
-  setReceiveProgress(fileMeta.size, fileMeta.size);
-  receiveCompleted = true;
-  receiveStatus.textContent = `✅ Descarga completada: ${fileMeta.name} (${formatBytes(blob.size)}).`;
-  console.log('Receptor: Descarga completada', { name: fileMeta.name, size: blob.size });
 
   setTimeout(() => {
     try {
@@ -480,3 +690,41 @@ async function finishReceivingFile() {
     }
   }, 1500);
 }
+
+function resetReceivingState({ abortWriter = false } = {}) {
+  if (abortWriter && fileWriter) {
+    try {
+      fileWriter.abort();
+    } catch (e) {
+      console.warn('No se pudo abortar el escritor de archivo:', e);
+    }
+  }
+
+  receivedChunks = [];
+  fileMeta = null;
+  receivedBytes = 0;
+  nextChunkIndex = 0;
+  receiveMode = 'memory';
+  fileWriter = null;
+  clearStorageChoiceControls();
+}
+
+window.addEventListener('beforeunload', () => {
+  try {
+    if (activeDownloadUrl) URL.revokeObjectURL(activeDownloadUrl);
+  } catch (e) {
+    console.warn('No se pudo liberar la URL temporal:', e);
+  }
+
+  try {
+    if (conn && conn.open) conn.close();
+  } catch (e) {
+    console.warn('No se pudo cerrar la conexión al salir:', e);
+  }
+
+  try {
+    if (peer && !peer.destroyed) peer.destroy();
+  } catch (e) {
+    console.warn('No se pudo destruir el peer al salir:', e);
+  }
+});
