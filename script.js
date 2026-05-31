@@ -1,13 +1,16 @@
+// Configuración de PeerJS (servidor público gratuito)
 const PEER_CONFIG = {
   host: '0.peerjs.com',
   port: 443,
   secure: true,
+  debug: 1,        // 1 = errores, 2 = warnings, 3 = todos los logs
 };
 
 let peer;
 let conn;
 let selectedFile;
 
+// Utilidad: formato de bytes
 function formatBytes(bytes) {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -16,7 +19,7 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-// ----- Envío -----
+// ---------- PANEL DE ENVÍO ----------
 const fileInput = document.getElementById('fileInput');
 const fileInfo = document.getElementById('fileInfo');
 const createRoomBtn = document.getElementById('createRoomBtn');
@@ -43,9 +46,12 @@ fileInput.addEventListener('change', (e) => {
 createRoomBtn.addEventListener('click', () => {
   if (!selectedFile) return;
 
+  // Destruir instancia previa si existe
+  if (peer) peer.destroy();
   peer = new Peer(undefined, PEER_CONFIG);
 
   peer.on('open', (id) => {
+    console.log('Emisor: Peer abierto con ID', id);
     roomIdDisplay.textContent = id;
     const currentUrl = new URL(window.location.href);
     currentUrl.searchParams.set('room', id);
@@ -60,24 +66,30 @@ createRoomBtn.addEventListener('click', () => {
 
   peer.on('connection', (connection) => {
     conn = connection;
-    sendStatus.textContent = 'Receptor conectado. Preparando transferencia...';
+    sendStatus.textContent = 'Receptor conectado. Iniciando transferencia...';
+    console.log('Emisor: Conexión entrante establecida');
 
     conn.on('open', () => {
+      console.log('Emisor: DataChannel abierto, comenzando envío');
       sendFile().catch(err => {
+        console.error('Error en envío:', err);
         sendStatus.textContent = 'Error: ' + err;
       });
     });
 
     conn.on('close', () => {
+      console.log('Emisor: DataChannel cerrado');
       sendStatus.textContent = 'Conexión cerrada.';
     });
 
     conn.on('error', (err) => {
+      console.error('Emisor: Error en conexión:', err);
       sendStatus.textContent = 'Error: ' + err;
     });
   });
 
   peer.on('error', (err) => {
+    console.error('Emisor: Error en Peer:', err);
     sendStatus.textContent = 'Error: ' + err;
   });
 });
@@ -88,30 +100,11 @@ copyBtn.addEventListener('click', () => {
   setTimeout(() => (copyBtn.textContent = '📋 Copiar'), 2000);
 });
 
-// Función que espera a que el buffer del canal se vacíe lo suficiente
-function waitForBufferDrain(dataChannel, threshold = 65536) {
-  return new Promise(resolve => {
-    if (dataChannel.bufferedAmount <= threshold) {
-      resolve();
-      return;
-    }
-    const onBufferedAmountLow = () => {
-      dataChannel.removeEventListener('bufferedamountlow', onBufferedAmountLow);
-      resolve();
-    };
-    dataChannel.addEventListener('bufferedamountlow', onBufferedAmountLow);
-    // Ajustar el umbral para que el evento se dispare cuando bajemos de ese valor
-    dataChannel.bufferedAmountLowThreshold = threshold;
-  });
-}
-
+// Función de envío con control de flujo sencillo basado en setTimeout
 async function sendFile() {
   if (!conn || !selectedFile) return;
 
-  const dataChannel = conn.dataChannel; // Canal subyacente
-  const CHUNK_SIZE = 16 * 1024;         // 16 KB
-  const BUFFER_LIMIT = 256 * 1024;      // Pausar si el buffer supera 256 KB
-
+  const CHUNK_SIZE = 16 * 1024; // 16 KB
   const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
   let sentChunks = 0;
 
@@ -124,41 +117,59 @@ async function sendFile() {
     size: selectedFile.size,
     totalChunks: totalChunks,
   });
+  console.log('Emisor: Metadata enviada');
 
-  const reader = selectedFile.stream().getReader();
+  // Leer archivo como ArrayBuffer para evitar problemas de stream
+  const arrayBuffer = await selectedFile.arrayBuffer();
+  const fileData = new Uint8Array(arrayBuffer);
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      // Crear copia exacta del chunk para evitar enviar buffers inflados
-      const chunk = new Uint8Array(value);
-      dataChannel.send(chunk.buffer);
-      sentChunks++;
-
-      // Actualizar progreso
-      const percent = Math.floor((sentChunks / totalChunks) * 100);
-      sendBarFill.style.width = percent + '%';
-      sendPercent.textContent = percent + '%';
-
-      // Control de backpressure: esperar si el buffer está muy lleno
-      if (dataChannel.bufferedAmount > BUFFER_LIMIT) {
-        await waitForBufferDrain(dataChannel, BUFFER_LIMIT / 2);
+  // Función auxiliar que espera a que el buffer baje de cierto umbral
+  const waitBuffer = () => {
+    return new Promise(resolve => {
+      if (conn.bufferedAmount <= 65536) { // 64 KB
+        resolve();
+        return;
       }
+      const check = setInterval(() => {
+        if (conn.bufferedAmount <= 65536) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 10);
+    });
+  };
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, fileData.length);
+    const chunk = fileData.slice(start, end);
+
+    // Enviar chunk (PeerJS acepta Uint8Array/ArrayBuffer)
+    conn.send(chunk.buffer);
+    sentChunks++;
+
+    const percent = Math.floor((sentChunks / totalChunks) * 100);
+    sendBarFill.style.width = percent + '%';
+    sendPercent.textContent = percent + '%';
+
+    // Control de backpressure: si el buffer crece mucho, esperar
+    if (conn.bufferedAmount > 1048576) { // 1 MB
+      await waitBuffer();
     }
 
-    // Enviar mensaje de finalización
-    conn.send({ type: 'end' });
-    sendStatus.textContent = '✅ Archivo enviado completamente.';
-  } catch (err) {
-    sendStatus.textContent = 'Error al enviar: ' + err;
-    // Intentar notificar al receptor del error (opcional)
-    try { conn.send({ type: 'error', message: err.toString() }); } catch(e) {}
+    // Pequeña pausa entre chunks para dejar respirar al navegador (opcional pero ayuda)
+    if (i % 100 === 0) {
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
+
+  // Enviar señal de fin
+  conn.send({ type: 'end' });
+  console.log('Emisor: Fin enviado');
+  sendStatus.textContent = '✅ Archivo enviado completamente.';
 }
 
-// ----- Recepción -----
+// ---------- PANEL DE RECEPCIÓN ----------
 const remoteIdInput = document.getElementById('remoteIdInput');
 const connectBtn = document.getElementById('connectBtn');
 const receiveProgress = document.getElementById('receiveProgress');
@@ -166,6 +177,7 @@ const receiveBarFill = document.getElementById('receiveBarFill');
 const receivePercent = document.getElementById('receivePercent');
 const receiveStatus = document.getElementById('receiveStatus');
 
+// Rellenar ID desde URL si existe
 const urlParams = new URLSearchParams(window.location.search);
 if (urlParams.has('room')) {
   remoteIdInput.value = urlParams.get('room');
@@ -174,25 +186,6 @@ if (urlParams.has('room')) {
 let receivedChunks = [];
 let fileMeta = null;
 let totalReceivedChunks = 0;
-
-// Manejador para escritura en disco (archivos muy grandes)
-let fileWriter = null;
-let writableStream = null;
-
-async function saveToDisk(chunk) {
-  if (!writableStream) {
-    // Primera vez: pedir al usuario dónde guardar
-    const handle = await window.showSaveFilePicker({
-      suggestedName: fileMeta.name,
-      types: [{
-        description: 'Archivo',
-        accept: { 'application/octet-stream': ['.' + (fileMeta.name.split('.').pop() || 'bin')] }
-      }]
-    });
-    writableStream = await handle.createWritable();
-  }
-  await writableStream.write(chunk);
-}
 
 connectBtn.addEventListener('click', () => {
   const remoteId = remoteIdInput.value.trim();
@@ -208,91 +201,82 @@ connectBtn.addEventListener('click', () => {
     if (roomParam) peerId = roomParam;
   } catch (e) {}
 
+  // Destruir instancia previa
+  if (peer) peer.destroy();
   peer = new Peer(undefined, PEER_CONFIG);
 
-  peer.on('open', () => {
+  peer.on('open', (id) => {
+    console.log('Receptor: Peer abierto con ID', id);
     receiveStatus.textContent = 'Conectando...';
     conn = peer.connect(peerId, { reliable: true });
 
     conn.on('open', () => {
+      console.log('Receptor: DataChannel abierto');
       receiveStatus.textContent = 'Conexión establecida. Esperando archivo...';
       connectBtn.disabled = true;
       remoteIdInput.disabled = true;
     });
 
-    conn.on('data', async (data) => {
-      // Chunk binario
+    conn.on('data', (data) => {
+      // Distinguir tipo de dato
       if (data instanceof ArrayBuffer) {
+        // Chunk binario
         const chunk = new Uint8Array(data);
-        receivedChunks.push(chunk);       // respaldo en RAM para archivos no enormes
+        receivedChunks.push(chunk);
         totalReceivedChunks++;
         if (fileMeta && totalReceivedChunks <= fileMeta.totalChunks) {
           const percent = Math.floor((totalReceivedChunks / fileMeta.totalChunks) * 100);
           receiveBarFill.style.width = percent + '%';
           receivePercent.textContent = percent + '%';
         }
-        // Si ya tenemos escritor en disco (archivo grande), escribir incrementalmente
-        if (writableStream) {
-          await writableStream.write(chunk);
-        }
         return;
       }
 
-      // Mensajes de control (objetos)
-      if (data && typeof data === 'object') {
+      // Mensaje de control (objeto JSON)
+      if (typeof data === 'object' && data !== null) {
         if (data.type === 'meta') {
+          console.log('Receptor: Metadata recibida', data);
           fileMeta = data;
           receivedChunks = [];
           totalReceivedChunks = 0;
           receiveProgress.style.display = 'block';
           receiveStatus.textContent = `Recibiendo: ${data.name} (${formatBytes(data.size)})`;
-          // Si el archivo supera los 500 MB, intentar usar escritura en disco
-          if (data.size > 500 * 1024 * 1024 && window.showSaveFilePicker) {
-            try {
-              await saveToDisk(null); // iniciar el flujo
-              receiveStatus.textContent += ' (guardando directamente en disco)';
-            } catch (e) {
-              // El usuario canceló o el navegador no soporta, caer en Blob
-              writableStream = null;
-            }
-          }
         } else if (data.type === 'end') {
-          receiveStatus.textContent = 'Archivo recibido. Finalizando...';
-          // Si usamos escritura en disco, cerramos el stream
-          if (writableStream) {
-            await writableStream.close();
-            receiveStatus.textContent = '✅ Descarga completada.';
-          } else {
-            // Método clásico con Blob
-            const blob = new Blob(receivedChunks);
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileMeta.name;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            receiveStatus.textContent = '✅ Descarga completada.';
-          }
-          conn.close();
-          peer.destroy();
-        } else if (data.type === 'error') {
-          receiveStatus.textContent = 'Error del remitente: ' + data.message;
+          console.log('Receptor: Fin recibido');
+          receiveStatus.textContent = 'Archivo recibido. Guardando...';
+          // Ensamblar y descargar
+          const blob = new Blob(receivedChunks);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fileMeta.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          receiveStatus.textContent = '✅ Descarga completada.';
+          // Cerrar conexión limpiamente
+          setTimeout(() => {
+            if (conn) conn.close();
+            if (peer) peer.destroy();
+          }, 500);
         }
       }
     });
 
     conn.on('close', () => {
+      console.log('Receptor: DataChannel cerrado');
       receiveStatus.textContent = 'Conexión cerrada.';
     });
 
     conn.on('error', (err) => {
+      console.error('Receptor: Error en conexión:', err);
       receiveStatus.textContent = 'Error: ' + err;
     });
   });
 
   peer.on('error', (err) => {
+    console.error('Receptor: Error en Peer:', err);
     receiveStatus.textContent = 'Error: ' + err;
   });
 });
